@@ -1,0 +1,20 @@
+# Configuration for collocation-only RAR
+experiment:
+  name: "rar_collocation"
+  desc: "Collocation-only Residual-based Adaptive Refinement"
+training:
+  epochs: 10000
+  lr: 0.001
+  batch_size: 128
+  num_domain: 2000
+  num_boundary: 400
+  num_loads: 100
+model:
+  branch_layers: [100, 128, 128, 50]
+  trunk_layers: [2, 128, 128, 50]
+  activation: "tanh"
+rar:
+  enabled: true
+  type: "collocation"
+  frequency: 1000        # Interval in epochs to add points
+  num_points_to_add: 50  # Number of collocation points to add each time

@@ -1,0 +1,23 @@
+name: pi_deeponet_rar
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy>=1.21
+  - matplotlib>=3.5
+  - scipy>=1.7
+  - sympy>=1.9
+  - pytorch>=2.0
+  - cpuonly
+  - ipykernel
+  - jupyter
+  - pandas
+  - pyyaml
+  - pip
+  - pip:
+      - deepxde>=1.9.0
+      - hydra-core>=1.3.2
+      - omegaconf>=2.3.0
+      - wandb
