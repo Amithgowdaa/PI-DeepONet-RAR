@@ -1,78 +1,156 @@
-# Physics-Informed DeepONet with Residual-based Adaptive Refinement (PI-DeepONet-RAR) for Solid Mechanics
+# Physics-Informed DeepONet with Residual-based Adaptive Refinement (PI-DeepONet-RAR)
 
-This repository implements a Physics-Informed Deep Operator Network (PI-DeepONet) combined with Residual-based Adaptive Refinement (RAR) to solve 2D linear elasticity problems (Navier's equations). The physical benchmark is the classic **Kirsch Problem**: a plate with a circular hole under uniaxial tension.
+A research project investigating **where to add training data** in operator learning for solid mechanics — in the spatial domain, in the load function space, or both — using **residual-based active learning** to find the model's weak points.
+
+## Problem Statement
+
+> I'm building a neural network that learns to predict stress distributions for any load pattern on a plate with a hole. Instead of running a slow physics simulation every time, the net gives instant predictions. I'm testing where to add training data — in the 2D space, in the load parameter space, or both — using active learning to find the model's weak points.
+
+## Architecture
+
+```
+┌──────────────────┐     ┌──────────────────┐
+│   Branch Net     │     │    Trunk Net      │
+│                  │     │                   │
+│  T(y) at sensors │     │  Coords (x, y)    │
+│  [100 sensors]   │     │  [2D input]       │
+│       ↓          │     │       ↓           │
+│  MLP: 100→128    │     │  MLP: 2→128       │
+│       →128→100   │     │      →128→50      │
+│       ↓          │     │       ↓           │
+│  [P×2 features]  │     │  [P features]     │
+└───────┬──────────┘     └───────┬───────────┘
+        │         dot product    │
+        └──────────┬─────────────┘
+                   ↓
+            u(x,y), v(x,y)
+         [displacement fields]
+                   ↓
+         ┌─────────┴─────────┐
+         │  Physics Loss     │
+         │  ∇·σ = 0 (PDE)    │
+         │  σ·n = 0 (hole)   │
+         │  σ_xx = T (edge)  │
+         └─────────┬─────────┘
+                   ↓
+         RAR: Add points/loads
+         where residual is HIGH
+```
+
+## Experimental Arms
+
+| Arm | Strategy | What adapts? |
+|---|---|---|
+| **Baseline** | Fixed uniform sampling | Nothing |
+| **Collocation RAR** | Add spatial points at high-residual locations | Trunk input space (x, y) |
+| **Load RAR** | Add load functions the model struggles with | Branch input space T(y) |
+| **Combined RAR** | Both simultaneously | Both spaces |
 
 ## Project Structure
 
 ```
-pi-deeponet-rar-solid-mechanics/
+PI-DeepONet-RAR/
 │
-├── README.md                 # Project overview, how to run, results summary
-├── LICENSE                   # Apache 2.0 License
-├── environment.yml           # Conda environment file
-├── requirements.txt          # Pip fallback
+├── README.md                    # This file
+├── LICENSE                      # Apache 2.0
+├── requirements.txt             # pip install -r requirements.txt
+├── kaggle_run_all.py            # 🚀 One-command Kaggle runner
+├── run_tests.py                 # Test suite runner
 │
-├── configs/                  # HYDRA config files for the 4 arms
-│   ├── baseline.yaml         # Uniform sampling
-│   ├── rar_collocation.yaml  # Collocation-only RAR
-│   ├── rar_load.yaml         # Load-function-only RAR
-│   └── rar_combined.yaml     # Combined RAR
+├── configs/                     # YAML configs for the 4 arms
+│   ├── baseline.yaml
+│   ├── rar_collocation.yaml
+│   ├── rar_load.yaml
+│   └── rar_combined.yaml
 │
-├── src/                      # Core DeepXDE / PyTorch code
-│   ├── __init__.py
-│   ├── model.py              # PI-DeepONet architecture definition
-│   ├── physics.py            # 2D Linear elasticity PDE residuals (Navier)
-│   ├── data_generation.py    # Scripts to generate training data for Branch net
-│   └── train.py              # Main training loop (reads from configs/)
+├── src/                         # Core PyTorch code
+│   ├── model.py                 # PIDeepONet architecture
+│   ├── physics.py               # 2D elasticity PDE residuals
+│   ├── data_generation.py       # GRF load function sampling
+│   └── train.py                 # Training loop with RAR
 │
-├── fem_baseline/             # FEniCS scripts for ground truth
-│   ├── kirsch_fem.py         # FEniCS solver for the plate with a hole
-│   └── analytical_kirsch.py  # Python implementation of the exact Kirsch equations
+├── fem_baseline/                # Ground truth
+│   ├── analytical_kirsch.py     # Exact Kirsch solution (closed-form)
+│   └── kirsch_fem.py            # FEniCS placeholder (not needed)
 │
-├── notebooks/                # Jupyter notebooks for analysis and plotting
-│   ├── 01_validate_fem.ipynb # Plots FEM vs Analytical Kirsch
-│   ├── 02_plot_losses.ipynb  # Plots training loss curves for all 4 arms
-│   └── 03_error_analysis.ipynb # Calculates L2 relative errors, stress concentration factors
+├── tests/                       # Unit tests
+│   ├── test_model.py
+│   ├── test_physics.py
+│   ├── test_data_generation.py
+│   └── test_analytical.py
 │
-└── report/                   # LaTeX source for technical report
+├── notebooks/                   # Analysis & visualization
+│   ├── 01_validate_fem.ipynb
+│   ├── 02_plot_losses.ipynb
+│   └── 03_error_analysis.ipynb
+│
+├── results/                     # Generated outputs (gitignored)
+│   ├── *_losses.csv
+│   ├── *_best.pt
+│   └── plots/
+│
+└── report/                      # LaTeX report
     ├── main.tex
     └── references.bib
 ```
 
-## Methodology & Experimental Arms
+## Quick Start
 
-To assess the performance of adaptive training strategies in operator learning for mechanics, we run four distinct configurations (arms):
+### Option 1: Kaggle (Recommended)
 
-1. **Baseline**: Training with a fixed, uniform distribution of collocation points and loading functions.
-2. **RAR Collocation**: Iteratively adds collocation points in regions of high PDE residuals (stress concentrations).
-3. **RAR Load**: Iteratively refines the load function space, adding function samples where predictions exhibit high residuals.
-4. **RAR Combined**: Performs adaptive refinement on both coordinates (collocation) and load functions (branch net inputs) simultaneously.
+1. Upload this repository as a Kaggle dataset
+2. Create a new notebook and run:
 
-## Getting Started
+```python
+# Cell 1: Install dependencies
+!pip install -q torch numpy matplotlib scipy pyyaml pandas
 
-### Installation
-Create and activate the Conda environment:
-```bash
-conda env create -f environment.yml
-conda activate pi_deeponet_rar
+# Cell 2: Quick test run (~5 min)
+%cd /kaggle/input/pi-deeponet-rar/
+!python kaggle_run_all.py --quick
+
+# Cell 3: Full run (~2-3 hours on GPU)
+!python kaggle_run_all.py
 ```
-Or use pip:
+
+### Option 2: Local
+
 ```bash
+# Install
 pip install -r requirements.txt
+
+# Run tests
+python run_tests.py
+
+# Run individual experiments
+python src/train.py --config configs/baseline.yaml
+python src/train.py --config configs/rar_collocation.yaml
+python src/train.py --config configs/rar_load.yaml
+python src/train.py --config configs/rar_combined.yaml
+
+# Or run all at once
+python kaggle_run_all.py --quick  # Fast test
+python kaggle_run_all.py          # Full experiment
 ```
 
-### Running Experiments
-Use the main training entrypoint with Hydra configurations:
+### Option 3: Run specific arms
+
 ```bash
-# Run baseline
-python src/train.py --config-name baseline
-
-# Run collocation-only RAR
-python src/train.py --config-name rar_collocation
-
-# Run load-only RAR
-python src/train.py --config-name rar_load
-
-# Run combined RAR
-python src/train.py --config-name rar_combined
+python kaggle_run_all.py --arms baseline rar_combined --quick
 ```
+
+## Key Physics
+
+**Kirsch Problem**: An infinite plate with a circular hole of radius R under uniaxial tension T.
+
+- **Governing equations**: 2D Navier-Cauchy (linear elasticity, plane stress)
+- **Boundary conditions**: Traction-free hole surface, applied tension on outer edge
+- **Key result**: Stress Concentration Factor (SCF) = 3.0 at the hole boundary
+- **Non-dimensionalized**: E = 1.0, ν = 0.3 (stresses normalized by T)
+
+## References
+
+1. Lu et al. "Learning nonlinear operators via DeepONet" — *Nature Machine Intelligence* (2021)
+2. Wang et al. "Learning the solution operator of parametric PDEs with PI-DeepONets" — *Science Advances* (2021)
+3. Raissi et al. "Physics-informed neural networks" — *J. Computational Physics* (2019)
+4. Lu et al. "DeepXDE: A deep learning library for solving DEs" — *SIAM Review* (2021)
