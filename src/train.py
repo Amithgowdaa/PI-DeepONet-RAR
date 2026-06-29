@@ -448,7 +448,10 @@ def main():
           f"{num_boundary} boundary pts")
 
     # ─── Setup logging ───
-    results_dir = os.path.join(_project_root, "results")
+    if os.path.exists('/kaggle/working'):
+        results_dir = os.path.join('/kaggle/working', 'results')
+    else:
+        results_dir = os.path.join(_project_root, "results")
     os.makedirs(results_dir, exist_ok=True)
     logger = LossLogger(os.path.join(results_dir, f"{exp_name}_losses.csv"))
 

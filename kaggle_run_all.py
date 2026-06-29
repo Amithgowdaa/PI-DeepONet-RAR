@@ -35,8 +35,14 @@ from physics import compute_stresses
 # ─── Setup paths ───
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(PROJECT_ROOT, 'src')
-RESULTS_DIR = os.path.join(PROJECT_ROOT, 'results')
-PLOTS_DIR = os.path.join(PROJECT_ROOT, 'results', 'plots')
+
+# When uploaded as a Kaggle dataset, /kaggle/input is read-only.
+# Write output files (csv, pt, png) to /kaggle/working/results instead.
+if os.path.exists('/kaggle/working'):
+    RESULTS_DIR = os.path.join('/kaggle/working', 'results')
+else:
+    RESULTS_DIR = os.path.join(PROJECT_ROOT, 'results')
+PLOTS_DIR = os.path.join(RESULTS_DIR, 'plots')
 sys.path.insert(0, SRC_DIR)
 sys.path.insert(0, os.path.join(PROJECT_ROOT, 'fem_baseline'))
 
