@@ -1,0 +1,6 @@
+scikit-fem>=9.0
+gmsh
+meshio
+numpy
+scipy
+pandas

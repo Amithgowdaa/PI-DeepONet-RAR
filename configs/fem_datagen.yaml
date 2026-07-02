@@ -1,0 +1,44 @@
+# ============================================================================
+# FEM Data Generation Config — PI-DeepONet Ablation Study
+# ============================================================================
+# Two geometries solved under plane stress (steel) across multiple load cases.
+# Output: stress/displacement fields on uniform grids, saved as CSV.
+
+material:
+  E: 200.0e9        # Young's modulus [Pa] (200 GPa steel)
+  nu: 0.3           # Poisson's ratio
+
+# ── Geometry 1: Plate with circular hole ────────────────────────────────────
+# Quarter-symmetry model (first quadrant only).
+# Uniaxial tension on right edge, symmetry BCs on left & bottom.
+geometry1:
+  name: plate_hole
+  Lx: 2.0           # plate half-width [m] (full plate = 4m, quarter = 2m)
+  Ly: 2.0           # plate half-height [m]
+  hole_center: [0.0, 0.0]   # at origin for quarter-symmetry
+  hole_radius: 0.25         # [m]
+  loads_MPa: [10, 25, 50, 75, 100]
+  grid_nx: 50
+  grid_ny: 50
+
+# ── Geometry 2: Pressure vessel nozzle cutout ───────────────────────────────
+# Full plate model. Biaxial pressure on all outer edges.
+geometry2:
+  name: vessel
+  Lx: 3.0           # plate width [m]
+  Ly: 1.5           # plate height [m]
+  hole_center: [1.5, 0.75]  # centered
+  hole_radius: 0.2          # [m]
+  pressures_MPa: [1, 2, 5, 10, 20]
+  grid_nx: 50
+  grid_ny: 50
+
+# ── Mesh parameters ────────────────────────────────────────────────────────
+mesh:
+  lc_bulk: 0.05              # characteristic length far from hole [m]
+  refinement_factor: 3       # mesh is 3× finer near hole boundary
+
+# ── Output ──────────────────────────────────────────────────────────────────
+output:
+  directory: /kaggle/working/   # Kaggle output path
+  local_directory: ./results/fem_datagen/  # fallback for local runs

@@ -1,343 +1,332 @@
 """
-Kaggle / Colab Runner — PI-DeepONet-RAR Full Experiment
-========================================================
+PI-DeepONet FEM Data Generation -- Kaggle Runner
+=================================================
 
-Runs all 4 experimental arms sequentially and generates comparison plots.
+USAGE ON KAGGLE:
+  1. Upload PI-DeepONet-RAR repo as a Kaggle Dataset (from GitHub)
+  2. In a new notebook, add that dataset as input
+  3. Copy-paste this entire file into a single cell and run
 
-Usage (from project root):
-    python kaggle_run_all.py              # Full run
-    python kaggle_run_all.py --quick      # Quick test run (~5 min)
-    python kaggle_run_all.py --arms baseline rar_collocation  # Specific arms
+The script auto-detects:
+  - Whether it is running on Kaggle or locally
+  - The dataset input path (scans /kaggle/input/ for our package)
+  - Installs missing pip dependencies on Kaggle automatically
 
-In Kaggle notebook:
-    !python kaggle_run_all.py --quick
+Structure (designed as notebook cells):
+  Cell 1: Install dependencies + path setup
+  Cell 2: Imports
+  Cell 3: Material + mesh setup functions
+  Cell 4: Geometry 1 solver loop (plate with hole)
+  Cell 5: Geometry 2 solver loop (vessel cutout)
+  Cell 6: CSV export + validation prints
+
+All output goes to /kaggle/working/ (Kaggle) or ./results/fem_datagen/ (local).
 """
 
-import os
-import sys
-import argparse
 import subprocess
-import time
-import yaml
+import sys
+import os
+import glob
+
+
+# ============================================================================
+# CELL 1: INSTALL DEPENDENCIES + PATH SETUP
+# ============================================================================
+# scikit-fem: pure-Python FEM library (no C++ compilation needed)
+# gmsh: industry-standard mesh generator with Python API
+# meshio: mesh format converter (gmsh -> scikit-fem)
+# Note: FEniCS CANNOT be installed on Kaggle due to C++ dependency chain.
+
+ON_KAGGLE = os.path.exists("/kaggle/working")
+
+def install_dependencies():
+    """Install FEM dependencies. Run this once at notebook start."""
+    packages = ["scikit-fem", "gmsh", "meshio", "pyyaml", "pandas"]
+    for pkg in packages:
+        print(f"Installing {pkg}...")
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", "-q", pkg
+        ])
+    print("All dependencies installed.")
+
+
+def find_repo_root():
+    """
+    Auto-detect the repo root directory.
+
+    On Kaggle: scans /kaggle/input/*/  for a directory containing data/solvers.py
+    Locally:   uses __file__ directory (when run as a .py script)
+    """
+    if ON_KAGGLE:
+        # Kaggle datasets are mounted under /kaggle/input/<dataset-name>/
+        # The dataset name is auto-generated from the GitHub repo name.
+        # Scan all input datasets for our package marker file.
+        search_pattern = "/kaggle/input/*"
+        for candidate in sorted(glob.glob(search_pattern)):
+            marker = os.path.join(candidate, "data", "solvers.py")
+            if os.path.isfile(marker):
+                print(f"[setup] Found repo at: {candidate}")
+                return candidate
+        # Fallback: maybe a subdirectory (some datasets nest one level deeper)
+        search_pattern_nested = "/kaggle/input/*/*"
+        for candidate in sorted(glob.glob(search_pattern_nested)):
+            marker = os.path.join(candidate, "data", "solvers.py")
+            if os.path.isfile(marker):
+                print(f"[setup] Found repo at: {candidate}")
+                return candidate
+        raise FileNotFoundError(
+            "Could not find PI-DeepONet-RAR dataset in /kaggle/input/. "
+            "Make sure you added the dataset as input to this notebook. "
+            "Expected to find data/solvers.py inside the dataset."
+        )
+    else:
+        # Local run: use __file__ if available, else current directory
+        try:
+            return os.path.dirname(os.path.abspath(__file__))
+        except NameError:
+            # __file__ not defined (e.g., interactive Python / Jupyter)
+            return os.getcwd()
+
+
+# -- Auto-install on Kaggle --------------------------------------------------
+if ON_KAGGLE:
+    install_dependencies()
+
+# -- Set up import path ------------------------------------------------------
+REPO_ROOT = find_repo_root()
+sys.path.insert(0, REPO_ROOT)
+print(f"[setup] REPO_ROOT = {REPO_ROOT}")
+
+
+# ============================================================================
+# CELL 2: IMPORTS
+# ============================================================================
+
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend for Kaggle
-import matplotlib.pyplot as plt
-import torch
-from model import PIDeepONet
-from analytical_kirsch import (
-        analytical_kirsch_stress,
-        stress_concentration_factor,
-    )
-from physics import compute_stresses
+import time
 
-# ─── Setup paths ───
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-SRC_DIR = os.path.join(PROJECT_ROOT, 'src')
-
-# When uploaded as a Kaggle dataset, /kaggle/input is read-only.
-# Write output files (csv, pt, png) to /kaggle/working/results instead.
-if os.path.exists('/kaggle/working'):
-    RESULTS_DIR = os.path.join('/kaggle/working', 'results')
-else:
-    RESULTS_DIR = os.path.join(PROJECT_ROOT, 'results')
-PLOTS_DIR = os.path.join(RESULTS_DIR, 'plots')
-sys.path.insert(0, SRC_DIR)
-sys.path.insert(0, os.path.join(PROJECT_ROOT, 'fem_baseline'))
-
-ALL_ARMS = ['baseline', 'rar_collocation', 'rar_load', 'rar_combined']
-ARM_COLORS = {
-    'baseline': '#6C757D',
-    'rar_collocation': '#0D6EFD',
-    'rar_load': '#198754',
-    'rar_combined': '#DC3545',
-}
-ARM_LABELS = {
-    'baseline': 'Baseline (Uniform)',
-    'rar_collocation': 'Collocation RAR',
-    'rar_load': 'Load RAR',
-    'rar_combined': 'Combined RAR',
-}
+from data.solvers import solve_plate_with_hole, solve_vessel_cutout
+from data.analytical import compute_kirsch_l2_error
 
 
-def run_experiment(arm_name, quick=False):
-    """Run a single experimental arm via train.py."""
-    config_path = os.path.join(PROJECT_ROOT, 'configs', f'{arm_name}.yaml')
-    cmd = [sys.executable, os.path.join(SRC_DIR, 'train.py'),
-           '--config', config_path]
-    if quick:
-        cmd.append('--quick')
+# ============================================================================
+# CELL 3: MATERIAL + MESH CONFIGURATION
+# ============================================================================
 
-    print(f"\n{'='*60}")
-    print(f"  Running: {ARM_LABELS[arm_name]}")
-    print(f"  Config:  {config_path}")
-    print(f"{'='*60}")
+# Steel properties
+E = 200.0e9      # Young's modulus [Pa] = 200 GPa
+NU = 0.3         # Poisson's ratio
 
-    start = time.time()
-    result = subprocess.run(cmd, capture_output=False)
-    elapsed = time.time() - start
+# Mesh parameters
+LC_BULK = 0.05   # characteristic length far from hole [m]
+REFINEMENT = 3   # 3x finer near hole boundary
 
-    if result.returncode != 0:
-        print(f"  ⚠ {arm_name} returned non-zero exit code: {result.returncode}")
-    else:
-        print(f"  ✓ {arm_name} completed in {elapsed:.1f}s")
+# Output grid
+GRID_NX = 50
+GRID_NY = 50
 
-    return result.returncode
+# Output directory: always write to /kaggle/working/ on Kaggle
+OUTPUT_DIR = "/kaggle/working/" if ON_KAGGLE else os.path.join(REPO_ROOT, "results", "fem_datagen")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-
-def plot_loss_comparison(arms):
-    """Plot training loss curves for all completed arms."""
-    os.makedirs(PLOTS_DIR, exist_ok=True)
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('PI-DeepONet-RAR: Training Loss Comparison', fontsize=14, fontweight='bold')
-
-    loss_types = [
-        ('total_loss', 'Total Loss'),
-        ('pde_loss', 'PDE Residual Loss'),
-        ('bc_loss', 'Boundary Condition Loss'),
-    ]
-
-    for ax, (col, title) in zip(axes, loss_types):
-        for arm in arms:
-            csv_path = os.path.join(RESULTS_DIR, f'{arm}_losses.csv')
-            if not os.path.exists(csv_path):
-                continue
-            df = pd.read_csv(csv_path)
-            ax.semilogy(df['epoch'], df[col],
-                        label=ARM_LABELS[arm],
-                        color=ARM_COLORS[arm],
-                        alpha=0.85,
-                        linewidth=1.5)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel(title)
-        ax.set_title(title)
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    save_path = os.path.join(PLOTS_DIR, 'loss_comparison.png')
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"\n  📊 Loss comparison plot saved: {save_path}")
+print(f"Environment: {'Kaggle' if ON_KAGGLE else 'Local'}")
+print(f"Output directory: {OUTPUT_DIR}")
+print(f"Material: E = {E/1e9:.0f} GPa, nu = {NU}")
+print(f"Mesh: lc_bulk = {LC_BULK}m, refinement = {REFINEMENT}x")
+print(f"Grid: {GRID_NX}x{GRID_NY} = {GRID_NX*GRID_NY} points per case")
 
 
-def plot_adaptive_growth(arms):
-    """Plot how domain points and loads grow over training for RAR arms."""
-    os.makedirs(PLOTS_DIR, exist_ok=True)
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle('RAR: Adaptive Growth of Training Data', fontsize=14, fontweight='bold')
-
-    for arm in arms:
-        csv_path = os.path.join(RESULTS_DIR, f'{arm}_losses.csv')
-        if not os.path.exists(csv_path):
-            continue
-        df = pd.read_csv(csv_path)
-        ax1.plot(df['epoch'], df['num_domain_pts'],
-                 label=ARM_LABELS[arm],
-                 color=ARM_COLORS[arm],
-                 linewidth=1.5)
-        ax2.plot(df['epoch'], df['num_loads'],
-                 label=ARM_LABELS[arm],
-                 color=ARM_COLORS[arm],
-                 linewidth=1.5)
-
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Domain Collocation Points')
-    ax1.set_title('Collocation Point Growth')
-    ax1.legend(fontsize=8)
-    ax1.grid(True, alpha=0.3)
-
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Active Load Functions')
-    ax2.set_title('Load Function Growth')
-    ax2.legend(fontsize=8)
-    ax2.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    save_path = os.path.join(PLOTS_DIR, 'rar_growth.png')
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  📊 RAR growth plot saved: {save_path}")
+def save_csv(grid_data: dict, load_value_pa: float, filepath: str) -> pd.DataFrame:
+    """Save grid data to CSV, dropping NaN rows (inside hole)."""
+    df = pd.DataFrame({
+        'x': grid_data['x'],
+        'y': grid_data['y'],
+        'sigma_xx': grid_data['sigma_xx'],
+        'sigma_yy': grid_data['sigma_yy'],
+        'sigma_xy': grid_data['sigma_xy'],
+        'u_x': grid_data['u_x'],
+        'u_y': grid_data['u_y'],
+        'load_value': load_value_pa,
+    })
+    df = df.dropna()
+    df.to_csv(filepath, index=False)
+    return df
 
 
-def compute_validation_errors(arms):
-    """
-    Evaluate each trained model against the analytical Kirsch solution
-    and report L2 relative errors and SCF accuracy.
-    """
+# ============================================================================
+# CELL 4: GEOMETRY 1 — PLATE WITH CIRCULAR HOLE
+# ============================================================================
+# Square plate 2m × 2m (quarter symmetry), hole radius 0.25m at origin.
+# Uniaxial tension on right edge, symmetry BCs on left/bottom.
+# Top and hole are traction-free.
 
+def run_geometry1():
+    """Solve Geometry 1 for all load cases."""
+    LX, LY = 2.0, 2.0
+    HOLE_RADIUS = 0.25
+    LOADS_MPA = [10, 25, 50, 75, 100]
 
-    # Validation grid (outside the hole)
-    R = 0.2
-    L = 1.0
-    T = 1.0
+    print("\n" + "=" * 70)
+    print("GEOMETRY 1: Plate with Circular Hole (Quarter Symmetry)")
+    print(f"  Domain: {LX}m x {LY}m, hole radius: {HOLE_RADIUS}m")
+    print(f"  Load cases: {LOADS_MPA} MPa")
+    print("=" * 70)
 
-    # Generate validation points
-    np.random.seed(999)
-    val_points = []
-    while len(val_points) < 2000:
-        pts = np.random.uniform(-L, L, (4000, 2))
-        valid = pts[np.sum(pts**2, axis=1) >= R**2]
-        val_points.extend(valid.tolist())
-    val_points = np.array(val_points[:2000])
+    results_g1 = []
 
-    # Analytical stresses
-    sxx_true, syy_true, sxy_true = analytical_kirsch_stress(
-        val_points[:, 0], val_points[:, 1], R=R, T=T
-    )
+    for i, sigma_mpa in enumerate(LOADS_MPA):
+        sigma_pa = sigma_mpa * 1e6
+        print(f"\n  [{i+1}/{len(LOADS_MPA)}] sigma = {sigma_mpa} MPa")
 
-    # Read num_sensors from the first arm's config
-    first_config_path = os.path.join(PROJECT_ROOT, 'configs', f'{arms[0]}.yaml')
-    with open(first_config_path, 'r') as f:
-        first_config = yaml.safe_load(f)
-    num_sensors = first_config['model']['branch_layers'][0]
-
-    # Uniform tension load for evaluation
-    load_uniform = torch.ones(1, num_sensors, dtype=torch.float32) * T
-
-    results = {}
-    true_scf = stress_concentration_factor(R, T)
-
-    print(f"\n{'='*60}")
-    print(f"  Validation Against Analytical Kirsch Solution")
-    print(f"  True SCF = {true_scf:.4f}")
-    print(f"{'='*60}")
-
-    for arm in arms:
-        model_path = os.path.join(RESULTS_DIR, f'{arm}_best.pt')
-        if not os.path.exists(model_path):
-            model_path = os.path.join(RESULTS_DIR, f'{arm}_final.pt')
-        if not os.path.exists(model_path):
-            print(f"  ⚠ No model found for {arm}")
-            continue
-
-        # Load architecture from the arm's config file
-        config_path = os.path.join(PROJECT_ROOT, 'configs', f'{arm}.yaml')
-        with open(config_path, 'r') as f:
-            arm_config = yaml.safe_load(f)
-        branch_layers = arm_config['model']['branch_layers']
-        trunk_layers = arm_config['model']['trunk_layers']
-
-        # Load model
-        model = PIDeepONet(
-            branch_layers=branch_layers,
-            trunk_layers=trunk_layers,
-            num_outputs=2,
+        result = solve_plate_with_hole(
+            sigma_applied=sigma_pa,
+            E=E, nu=NU,
+            Lx=LX, Ly=LY,
+            hole_radius=HOLE_RADIUS,
+            lc_bulk=LC_BULK,
+            refinement_factor=REFINEMENT,
+            grid_nx=GRID_NX, grid_ny=GRID_NY,
         )
-        model.load_state_dict(torch.load(model_path, map_location='cpu',
-                                         weights_only=True))
-        model.eval()
 
-        # Predict stresses using autograd (need gradients on coords)
-        coords_val = torch.tensor(val_points, dtype=torch.float32, requires_grad=True)
-        pred = model(load_uniform, coords_val)
-        u_pred = pred[0, :, 0:1]
-        v_pred = pred[0, :, 1:2]
-        stresses = compute_stresses(coords_val, u_pred, v_pred)
+        # Save CSV
+        filename = f"plate_hole_{sigma_mpa}MPa.csv"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        df = save_csv(result, sigma_pa, filepath)
 
-        sxx_pred = stresses['sigma_xx'].detach().numpy().squeeze()
-        syy_pred = stresses['sigma_yy'].detach().numpy().squeeze()
-        sxy_pred = stresses['sigma_xy'].detach().numpy().squeeze()
+        # Kirsch analytical validation
+        errors = compute_kirsch_l2_error(
+            x=result['x'], y=result['y'],
+            fem_sxx=result['sigma_xx'],
+            fem_syy=result['sigma_yy'],
+            fem_sxy=result['sigma_xy'],
+            a=HOLE_RADIUS,
+            sigma_inf=sigma_pa,
+        )
 
-        # L2 relative errors
-        l2_sxx = np.linalg.norm(sxx_pred - sxx_true) / (np.linalg.norm(sxx_true) + 1e-10)
-        l2_syy = np.linalg.norm(syy_pred - syy_true) / (np.linalg.norm(syy_true) + 1e-10)
-        l2_sxy = np.linalg.norm(sxy_pred - sxy_true) / (np.linalg.norm(sxy_true) + 1e-10)
+        # Print results
+        scf = result['max_von_mises'] / sigma_pa
+        print(f"    [OK] Saved: {filename} ({len(df)} points)")
+        print(f"    [OK] Mesh: {result['n_nodes']} nodes, {result['n_elements']} elements")
+        print(f"    [OK] Max von Mises: {result['max_von_mises']/1e6:.2f} MPa (SCF ~ {scf:.2f})")
+        print(f"    [OK] Kirsch L2 error: {errors['l2_combined']:.4f} "
+              f"(sxx: {errors['l2_sxx']:.4f}, syy: {errors['l2_syy']:.4f})")
+        print(f"    [OK] Time: {result['solve_time_s']:.1f}s")
 
-        # SCF: evaluate at (0, R)
-        scf_coord = torch.tensor([[0.0, R]], dtype=torch.float32, requires_grad=True)
-        pred_scf = model(load_uniform, scf_coord)
-        u_scf = pred_scf[0, :, 0:1]
-        v_scf = pred_scf[0, :, 1:2]
-        stress_scf = compute_stresses(scf_coord, u_scf, v_scf)
-        predicted_scf = stress_scf['sigma_xx'].item() / T
+        results_g1.append({
+            'load_MPa': sigma_mpa,
+            'max_vm_MPa': result['max_von_mises'] / 1e6,
+            'scf': scf,
+            'kirsch_l2': errors['l2_combined'],
+            'n_points': len(df),
+        })
 
-        results[arm] = {
-            'l2_sxx': l2_sxx,
-            'l2_syy': l2_syy,
-            'l2_sxy': l2_sxy,
-            'scf': predicted_scf,
-        }
-
-        print(f"\n  {ARM_LABELS[arm]}:")
-        print(f"    L2 errors: σ_xx={l2_sxx:.4f}, σ_yy={l2_syy:.4f}, σ_xy={l2_sxy:.4f}")
-        print(f"    SCF: {predicted_scf:.4f} (true: {true_scf:.4f}, "
-              f"error: {abs(predicted_scf - true_scf):.4f})")
-
-    # Save results table
-    if results:
-        df = pd.DataFrame(results).T
-        df.index.name = 'arm'
-        csv_path = os.path.join(RESULTS_DIR, 'validation_results.csv')
-        df.to_csv(csv_path)
-        print(f"\n  📊 Validation results saved: {csv_path}")
-
-        # Plot SCF comparison
-        os.makedirs(PLOTS_DIR, exist_ok=True)
-        fig, ax = plt.subplots(figsize=(8, 5))
-        arm_names = list(results.keys())
-        scf_vals = [results[a]['scf'] for a in arm_names]
-        colors = [ARM_COLORS[a] for a in arm_names]
-        labels = [ARM_LABELS[a] for a in arm_names]
-
-        bars = ax.bar(labels, scf_vals, color=colors, edgecolor='white', linewidth=1.5)
-        ax.axhline(y=true_scf, color='black', linestyle='--', linewidth=2,
-                    label=f'Theoretical ({true_scf:.1f})')
-        ax.set_ylabel('Stress Concentration Factor')
-        ax.set_title('SCF Prediction Accuracy by Arm')
-        ax.legend()
-        ax.set_ylim(0, 4.0)
-        ax.grid(axis='y', alpha=0.3)
-
-        save_path = os.path.join(PLOTS_DIR, 'scf_comparison.png')
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"  📊 SCF comparison plot saved: {save_path}")
+    return results_g1
 
 
-def main():
-    parser = argparse.ArgumentParser(description="PI-DeepONet-RAR: Run All Experiments")
-    parser.add_argument('--quick', action='store_true',
-                        help='Quick mode for testing (fewer epochs)')
-    parser.add_argument('--arms', nargs='+', default=ALL_ARMS,
-                        choices=ALL_ARMS,
-                        help='Which experimental arms to run')
-    parser.add_argument('--skip-training', action='store_true',
-                        help='Skip training and only generate plots')
-    args = parser.parse_args()
+# ============================================================================
+# CELL 5: GEOMETRY 2 — PRESSURE VESSEL NOZZLE CUTOUT
+# ============================================================================
+# Plate 3m x 1.5m (full plate), circular cutout at center, radius 0.2m.
+# Biaxial pressure on all outer edges, hole traction-free.
 
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+def run_geometry2():
+    """Solve Geometry 2 for all pressure cases."""
+    LX, LY = 3.0, 1.5
+    HOLE_CENTER = (1.5, 0.75)
+    HOLE_RADIUS = 0.2
+    PRESSURES_MPA = [1, 2, 5, 10, 20]
 
-    print("\n" + "═" * 60)
-    print("  PI-DeepONet-RAR: Full Experiment Suite")
-    print("  Arms: " + ", ".join(args.arms))
-    print("  Mode: " + ("Quick" if args.quick else "Full"))
-    print("═" * 60)
+    print("\n" + "=" * 70)
+    print("GEOMETRY 2: Pressure Vessel Nozzle Cutout (Full Plate)")
+    print(f"  Domain: {LX}m x {LY}m, hole center: {HOLE_CENTER}, radius: {HOLE_RADIUS}m")
+    print(f"  Pressure cases: {PRESSURES_MPA} MPa")
+    print("=" * 70)
 
-    # ─── Run experiments ───
-    if not args.skip_training:
-        overall_start = time.time()
-        for arm in args.arms:
-            run_experiment(arm, quick=args.quick)
-        total_time = time.time() - overall_start
-        print(f"\n  Total training time: {total_time:.1f}s ({total_time/60:.1f}min)")
+    results_g2 = []
 
-    # ─── Generate comparison plots ───
-    print("\n  Generating comparison plots...")
-    plot_loss_comparison(args.arms)
-    plot_adaptive_growth(args.arms)
+    for i, p_mpa in enumerate(PRESSURES_MPA):
+        p_pa = p_mpa * 1e6
+        print(f"\n  [{i+1}/{len(PRESSURES_MPA)}] p = {p_mpa} MPa")
 
-    # ─── Validation against analytical solution ───
-    print("\n  Running validation...")
-    compute_validation_errors(args.arms)
+        result = solve_vessel_cutout(
+            pressure=p_pa,
+            E=E, nu=NU,
+            Lx=LX, Ly=LY,
+            hole_center=HOLE_CENTER,
+            hole_radius=HOLE_RADIUS,
+            lc_bulk=LC_BULK,
+            refinement_factor=REFINEMENT,
+            grid_nx=GRID_NX, grid_ny=GRID_NY,
+        )
 
-    print("\n" + "═" * 60)
-    print("  All done! Check results/ directory for outputs.")
-    print("═" * 60 + "\n")
+        # Save CSV
+        filename = f"vessel_{p_mpa}MPa.csv"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        df = save_csv(result, p_pa, filepath)
+
+        print(f"    [OK] Saved: {filename} ({len(df)} points)")
+        print(f"    [OK] Mesh: {result['n_nodes']} nodes, {result['n_elements']} elements")
+        print(f"    [OK] Max von Mises: {result['max_von_mises']/1e6:.2f} MPa")
+        print(f"    [OK] Time: {result['solve_time_s']:.1f}s")
+
+        results_g2.append({
+            'pressure_MPa': p_mpa,
+            'max_vm_MPa': result['max_von_mises'] / 1e6,
+            'n_points': len(df),
+        })
+
+    return results_g2
+
+
+# ============================================================================
+# CELL 6: RUN ALL + SUMMARY
+# ============================================================================
+
+def run_all():
+    """Run both geometries and print final summary."""
+    t_total = time.time()
+
+    print("=" * 70)
+    print("PI-DeepONet FEM DATA GENERATION")
+    print("=" * 70)
+
+    # Geometry 1
+    results_g1 = run_geometry1()
+
+    # Geometry 2
+    results_g2 = run_geometry2()
+
+    # ── Final Summary ──────────────────────────────────────────────────────
+    total_time = time.time() - t_total
+
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+
+    print("\n  Geometry 1 - Plate with Hole (Uniaxial Tension):")
+    print(f"  {'Load (MPa)':>12} {'Max VM (MPa)':>14} {'SCF':>8} {'Kirsch L2':>12} {'Points':>8}")
+    print(f"  {'-'*58}")
+    for r in results_g1:
+        print(f"  {r['load_MPa']:>12} {r['max_vm_MPa']:>14.2f} {r['scf']:>8.2f} "
+              f"{r['kirsch_l2']:>12.4f} {r['n_points']:>8}")
+
+    print(f"\n  Geometry 2 - Vessel Cutout (Biaxial Pressure):")
+    print(f"  {'Pressure (MPa)':>15} {'Max VM (MPa)':>14} {'Points':>8}")
+    print(f"  {'-'*40}")
+    for r in results_g2:
+        print(f"  {r['pressure_MPa']:>15} {r['max_vm_MPa']:>14.2f} {r['n_points']:>8}")
+
+    # List output files
+    csv_files = sorted([f for f in os.listdir(OUTPUT_DIR) if f.endswith('.csv')])
+    print(f"\n  Output files ({len(csv_files)}):")
+    for f in csv_files:
+        size_kb = os.path.getsize(os.path.join(OUTPUT_DIR, f)) / 1024
+        print(f"    {f} ({size_kb:.0f} KB)")
+
+    print(f"\n  Total time: {total_time:.1f}s")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
-    main()
+    run_all()
